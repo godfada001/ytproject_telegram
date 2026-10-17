@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 
 import ytdlpRoute from "./routes/ytdlpRoute.js";
 import errorMiddleware from "./middleware/errorMiddleware.js";
+import tempDownloadRoute from "./routes/tempDownloadRoute.js";
 
 dotenv.config();
 
@@ -15,6 +16,7 @@ app.use(express.json());
 
 // Routes
 app.use("/api/ytdlp", ytdlpRoute);
+app.use("/api/temp-download", tempDownloadRoute);
 
 // Error handling
 app.use(errorMiddleware);

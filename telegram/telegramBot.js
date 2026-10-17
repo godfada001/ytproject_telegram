@@ -11,6 +11,23 @@ import {
 import { fromPath } from "node-telegram-bot-api/node";
 import fs from "node:fs/promises";
 
+import {
+  createShareLink,
+  startShareServer
+} from "../services/shareLinkService.js";
+
+/*
+ * Telegram's standard Bot API only accepts uploads up to 50 MB.
+ * Stay a little under it. Anything bigger is sent as a temporary
+ * download link instead.
+ */
+const MAX_TELEGRAM_UPLOAD_BYTES =
+  Number(
+    process.env.MAX_TELEGRAM_UPLOAD_MB || 49
+  ) *
+  1024 *
+  1024;
+
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
 if (!token) {
@@ -20,6 +37,55 @@ if (!token) {
 }
 
 const bot = new Bot(token);
+
+/*
+|--------------------------------------------------------------------------
+| Owner notifications
+|--------------------------------------------------------------------------
+|
+| Sends YOU a Telegram message (which pushes to your phone) when someone
+| uses the bot. Set OWNER_CHAT_ID in .env. Send /myid to the bot to find it.
+| You must have sent /start to the bot at least once yourself, or Telegram
+| won't let it message you.
+|
+*/
+
+const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
+
+const notifyOwner = async (ctx, action) => {
+  if (!OWNER_CHAT_ID) {
+    return;
+  }
+
+  try {
+    const user =
+      ctx.from ||
+      ctx.message?.from ||
+      ctx.callbackQuery?.from ||
+      {};
+
+    const name =
+      [user.first_name, user.last_name]
+        .filter(Boolean)
+        .join(" ") || "Unknown user";
+
+    const handle = user.username
+      ? ` (@${user.username})`
+      : "";
+
+    await bot.api.sendMessage({
+      chat_id: OWNER_CHAT_ID,
+      text:
+        `🔔 ${name}${handle} [id ${user.id ?? ctx.chat?.id}]\n` +
+        action
+    });
+  } catch (error) {
+    console.error(
+      "Unable to notify owner:",
+      error.message
+    );
+  }
+};
 
 /*
 |--------------------------------------------------------------------------
@@ -38,7 +104,15 @@ const pendingDownloads = new Map();
 |--------------------------------------------------------------------------
 */
 
+bot.command("myid", async (ctx) => {
+  await ctx.reply(
+    `Your chat ID is: ${ctx.chat.id}`
+  );
+});
+
 bot.command("start", async (ctx) => {
+  notifyOwner(ctx, "Started the bot");
+
   await ctx.reply(
     "👋 Welcome to the YT Downloader Bot!\n\nSend me a YouTube link and I'll show you the available video qualities."
   );
@@ -148,7 +222,11 @@ const formatProgressMessage = (
   );
 
   return (
-    `⬇️ Downloading ${resolution}p\n\n` +
+    `⬇️ Downloading ${
+      typeof resolution === "number"
+        ? `${resolution}p`
+        : resolution
+    }\n\n` +
     `${bar} ${progress.progress.toFixed(0)}%\n\n` +
     `⚡ Speed: ${
       progress.speed || "Calculating..."
@@ -225,6 +303,8 @@ bot.on("message", async (ctx) => {
     */
 
     if (youtubeRegex.test(text)) {
+      notifyOwner(ctx, `Sent a link:\n${text}`);
+
       try {
         await ctx.reply(
           "🔍 Checking available video qualities..."
@@ -428,11 +508,39 @@ for (const resolution of wantedResolutions) {
         |--------------------------------------------------------------------------
         */
 
+        /*
+         * Best audio-only format (m4a plays everywhere and
+         * can be sent to Telegram without converting).
+         * formats.audio is already limited to one language.
+         */
+        const bestAudio =
+          formats.audio
+            .filter(
+              (format) =>
+                format.ext === "m4a"
+            )
+            .sort(
+              (a, b) =>
+                (b.bitrate || 0) -
+                (a.bitrate || 0)
+            )[0] || null;
+
         pendingDownloads.set(
           ctx.chat.id,
           {
             url: text,
-            formats: videoFormats
+            title: formats.title,
+            formats: videoFormats,
+            audio: bestAudio
+              ? {
+                  formatId:
+                    bestAudio.formatId,
+                  size:
+                    getFormatSize(
+                      bestAudio
+                    )
+                }
+              : null
           }
         );
 
@@ -468,13 +576,24 @@ for (const resolution of wantedResolutions) {
         |--------------------------------------------------------------------------
         */
 
-        buttons.push([
-          {
-            text: "🎵 Audio only",
-            callback_data:
-              "download_audio"
-          }
-        ]);
+        if (bestAudio) {
+          const audioSize =
+            getFormatSize(bestAudio);
+
+          buttons.push([
+            {
+              text: `🎵 Audio only • ${
+                audioSize
+                  ? formatFileSize(
+                      audioSize
+                    )
+                  : "Size unknown"
+              }`,
+              callback_data:
+                "download_audio"
+            }
+          ]);
+        }
 
         /*
         |--------------------------------------------------------------------------
@@ -572,13 +691,92 @@ bot.on(
       if (
         data === "download_audio"
       ) {
+        if (!pending.audio) {
+          await ctx.answerCallbackQuery({
+            text: "No audio format found."
+          });
+
+          return;
+        }
+
         await ctx.answerCallbackQuery({
-          text: "Audio download selected."
+          text: "Audio selected"
         });
 
-        await ctx.reply(
-          "🎵 Audio downloading will be added next."
+        notifyOwner(
+          ctx,
+          "Started an audio download"
         );
+
+        const audioProgressMessage =
+          await ctx.reply(
+            `⬇️ Downloading audio...\n\n` +
+            `░░░░░░░░░░░░ 0%\n\n` +
+            `⚡ Speed: Calculating...\n` +
+            `⏱ ETA: Calculating...`
+          );
+
+        const audioResult =
+          await downloadVideo(
+            pending.url,
+            `audio:${pending.audio.formatId}`
+          );
+
+        const audioFile =
+          await waitForDownload(
+            audioResult.downloadId,
+            chatId,
+            "audio",
+            audioProgressMessage
+          );
+
+        const audioStats =
+          await fs.stat(audioFile.path);
+
+        console.log(
+          "AUDIO FILE SIZE:",
+          (
+            audioStats.size /
+            (1024 * 1024)
+          ).toFixed(2),
+          "MB"
+        );
+
+        if (
+          audioStats.size <=
+          MAX_TELEGRAM_UPLOAD_BYTES
+        ) {
+          await bot.api.sendAudio({
+            chat_id: chatId,
+            audio:
+              await fromPath(
+                audioFile.path
+              ),
+            title: pending.title,
+            caption: "🎵 Audio"
+          });
+        } else {
+          const audioLink =
+            createShareLink({
+              filePath: audioFile.path,
+              title: pending.title
+            });
+
+          await ctx.reply(
+            `📦 This audio is ${formatFileSize(
+              audioStats.size
+            )}, which is too large to send on Telegram.\n\n` +
+              `🔗 Download it here:\n${audioLink.url}\n\n` +
+              `⏳ The link expires in ${audioLink.expiresInMinutes} minutes, or right after you finish downloading.`,
+            {
+              link_preview_options: {
+                is_disabled: true
+              }
+            }
+          );
+        }
+
+        pendingDownloads.delete(chatId);
 
         return;
       }
@@ -620,6 +818,11 @@ bot.on(
         await ctx.answerCallbackQuery({
           text: `${resolution}p selected`
         });
+
+        notifyOwner(
+          ctx,
+          `Started a ${resolution}p download`
+        );
 
       
 const progressMessage =
@@ -669,7 +872,10 @@ const progressMessage =
 
         const file =
           await waitForDownload(
-            result.downloadId
+            result.downloadId,
+            chatId,
+            resolution,
+            progressMessage
           );
 
         console.log(
@@ -702,19 +908,54 @@ console.log(
   ).toFixed(2),
   "MB"
 );
-        await bot.api.sendVideo({
-          chat_id: chatId,
-          video:
-            await fromPath(
-              file.path
-            ),
-          caption:
-            `🎬 ${resolution}p video`
-        });
+        if (
+          fileStats.size <=
+          MAX_TELEGRAM_UPLOAD_BYTES
+        ) {
+          await bot.api.sendVideo({
+            chat_id: chatId,
+            video:
+              await fromPath(
+                file.path
+              ),
+            caption:
+              `🎬 ${resolution}p video`
+          });
 
-        console.log(
-          "Video sent to Telegram."
-        );
+          console.log(
+            "Video sent to Telegram."
+          );
+        } else {
+          /*
+          |--------------------------------------------------------------------------
+          | Too big for Telegram: send a temporary download link
+          |--------------------------------------------------------------------------
+          */
+
+          const link =
+            createShareLink({
+              filePath: file.path,
+              title: pending.title
+            });
+
+          await ctx.reply(
+            `📦 This video is ${formatFileSize(
+              fileStats.size
+            )}, which is too large to send on Telegram.\n\n` +
+              `🔗 Download it here:\n${link.url}\n\n` +
+              `⏳ The link expires in ${link.expiresInMinutes} minutes, or right after you finish downloading.`,
+            {
+              link_preview_options: {
+                is_disabled: true
+              }
+            }
+          );
+
+          console.log(
+            "Share link sent:",
+            link.url
+          );
+        }
 
         /*
         |--------------------------------------------------------------------------
@@ -742,5 +983,7 @@ console.log(
 console.log(
   "Telegram bot is running..."
 );
+
+startShareServer();
 
 await bot.startPolling();

@@ -15,6 +15,35 @@ const DOWNLOAD_DIR = path.resolve("downloads");
 const downloads = new Map();
 
 /**
+ * Cookie arguments so YouTube treats yt-dlp as a signed-in user
+ * instead of a bot ("Sign in to confirm you're not a bot").
+ *
+ * Set ONE of these in .env:
+ *   YTDLP_COOKIES_FILE=cookies.txt
+ *   YTDLP_COOKIES_BROWSER=firefox
+ *
+ * Read lazily (not at import time) because app.js loads .env
+ * after its imports have already run.
+ */
+const getAuthArgs = () => {
+  if (process.env.YTDLP_COOKIES_FILE) {
+    return [
+      "--cookies",
+      path.resolve(process.env.YTDLP_COOKIES_FILE)
+    ];
+  }
+
+  if (process.env.YTDLP_COOKIES_BROWSER) {
+    return [
+      "--cookies-from-browser",
+      process.env.YTDLP_COOKIES_BROWSER
+    ];
+  }
+
+  return [];
+};
+
+/**
  * Make sure the downloads directory exists
  */
 const ensureDownloadDirectory = async () => {
@@ -32,7 +61,7 @@ const runYtdlp = (args) => {
   return new Promise((resolve, reject) => {
     const process = spawn(
       YTDLP_PATH,
-      args
+      [...getAuthArgs(), ...args]
     );
 
     let stdout = "";
@@ -111,6 +140,43 @@ export const getVideoInfo = async (url) => {
 };
 
 /**
+ * Videos with several dubbed audio tracks list one audio format per
+ * language. Keep only one language so the bot can't grab a random one.
+ *
+ * Order of preference:
+ *   1. AUDIO_LANGUAGE from .env (e.g. "en", "ja"), if the video has it
+ *   2. the track YouTube marks as original/default
+ *   3. otherwise leave the list alone (single-track videos)
+ */
+const filterAudioByLanguage = (audio) => {
+  const wanted = (process.env.AUDIO_LANGUAGE || "")
+    .trim()
+    .toLowerCase();
+
+  const languageOf = (format) =>
+    (format.language || "").toLowerCase();
+
+  let chosen = [];
+
+  if (wanted) {
+    chosen = audio.filter((format) => {
+      const language = languageOf(format);
+
+      return (
+        language === wanted ||
+        language.startsWith(`${wanted}-`)
+      );
+    });
+  }
+
+  if (chosen.length === 0) {
+    chosen = audio.filter((format) => format.isDefault);
+  }
+
+  return chosen.length > 0 ? chosen : audio;
+};
+
+/**
  * Get available formats
  */
 export const getFormats = async (url) => {
@@ -176,7 +242,14 @@ export const getFormats = async (url) => {
       sampleRate: format.asr,
       filesize: format.filesize,
       filesizeApprox:
-        format.filesize_approx
+        format.filesize_approx,
+      language: format.language,
+      formatNote: format.format_note,
+      isDefault:
+        (format.language_preference || 0) > 0 ||
+        /\b(default|original)\b/i.test(
+          format.format_note || ""
+        )
     }));
 
   return {
@@ -184,7 +257,7 @@ export const getFormats = async (url) => {
     thumbnail: info.thumbnail,
     duration: info.duration,
     video,
-    audio
+    audio: filterAudioByLanguage(audio)
   };
 };
 
@@ -200,6 +273,22 @@ export const getFormats = async (url) => {
 const getFormatSelector = (
   quality
 ) => {
+  /*
+   * Audio-only download, e.g. "audio:140-1".
+   * Falls back to yt-dlp's best audio if that
+   * exact format isn't available.
+   */
+  if (
+    typeof quality === "string" &&
+    quality.startsWith("audio:")
+  ) {
+    const formatId = quality.slice(
+      "audio:".length
+    );
+
+    return `${formatId}/bestaudio`;
+  }
+
   /*
    * If Telegram already supplied
    * specific format IDs such as:
@@ -311,7 +400,7 @@ export const downloadVideo = async (
 
   const process = spawn(
     YTDLP_PATH,
-    args
+    [...getAuthArgs(), ...args]
   );
 
   let stderr = "";

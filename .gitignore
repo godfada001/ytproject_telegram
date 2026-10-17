@@ -1,4 +1,5 @@
 .env
+cookies.txt
 node_modules/
 downloads/*
 !downloads/.gitkeep
